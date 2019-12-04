@@ -1,0 +1,314 @@
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import warnings
+from math import sqrt
+from matplotlib import pyplot as plt, rcParams
+from numpy import median
+from scipy.special import boxcox1p
+from scipy.stats import skew
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.linear_model import Lasso, LassoCV
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import cross_val_score, GridSearchCV, KFold
+from sklearn.preprocessing import LabelEncoder
+
+warnings.filterwarnings('ignore')
+
+df_train = pd.read_csv('train.csv')
+df_test = pd.read_csv('test.csv')
+
+## EXPLORATORY DATA ANALYSIS
+
+# check for missing data
+PctMiss = df_train.isnull().sum()*100/len(df_train)
+PctMiss.sort_values(ascending=False, inplace=True)
+
+
+# remove features with top 5 missing data
+df_train.drop(['Alley', 'FireplaceQu', 'PoolQC', 'Fence', 'MiscFeature'], axis=1, inplace=True)
+df_test.drop(['Alley', 'FireplaceQu', 'PoolQC', 'Fence', 'MiscFeature'], axis=1, inplace=True)
+
+# classify into numeric and categorical
+feature_num = list(df_train.drop(['Id', 'SalePrice'],axis=1).select_dtypes(include=[np.number]).columns)
+feature_cat = list(df_train.select_dtypes(exclude=[np.number]).columns)
+
+'''
+# Plot
+# numeric features distribution
+nd_num = pd.melt(df_train, value_vars = feature_num)
+n1 = sns.FacetGrid(nd_num, col='variable', col_wrap=4, sharex=False, sharey=False)
+n1 = n1.map(sns.distplot, 'value')
+
+# numeric feartures vs SalePrice
+nd_num = pd.melt(df_train, id_vars='SalePrice', value_vars = feature_num)
+n1 = sns.FacetGrid(nd_num, col='variable', col_wrap=4, sharex=False, sharey=False)
+n1 = n1.map(sns.scatterplot, 'value', 'SalePrice')
+
+# categorical features distribution
+nd_cat = pd.melt(df_train, value_vars = feature_cat)
+n2 = sns.FacetGrid(nd_cat, col='variable', col_wrap=4, sharex=False, sharey=False)
+n2 = n2.map(sns.countplot, 'value')
+
+# categorical features vs SalePrice
+nd_cat = pd.melt(df_train, id_vars='SalePrice', value_vars = feature_cat)
+n2 = sns.FacetGrid(nd_cat, col='variable', col_wrap=4, sharex=False, sharey=False, size=5)
+n2 = n2.map(sns.boxplot, 'value', 'SalePrice')
+'''
+
+
+# check missing data for numeric features 
+PctMiss_num_train = df_train[feature_num].isnull().sum()*100/len(df_train)
+PctMiss_num_train.sort_values(ascending=False, inplace=True)
+
+PctMiss_num_test = df_test[feature_num].isnull().sum()*100/len(df_test)
+PctMiss_num_test.sort_values(ascending=False, inplace=True)
+
+
+# impute missing data of LotFrontage according to Neighborhood
+lotfrontage_by_neighborhood = df_train.groupby('Neighborhood').LotFrontage.median()
+for ngh in lotfrontage_by_neighborhood.index:
+    df_train.loc[(df_train.LotFrontage.isnull()) & (df_train.Neighborhood==ngh), ['LotFrontage']] = lotfrontage_by_neighborhood[ngh]
+    df_test.loc[(df_test.LotFrontage.isnull()) & (df_test.Neighborhood==ngh), ['LotFrontage']] = lotfrontage_by_neighborhood[ngh]
+
+# impute missing data for remaining numeric features
+for x in feature_num:
+    df_train[x].fillna(0, inplace=True)
+    df_test[x].fillna(0, inplace=True)
+
+# remove outliers
+df_train.drop(df_train[df_train.GrLivArea>4500].index, inplace=True)
+df_train.drop(df_train[df_train.LotFrontage>300].index, inplace=True)
+df_train.drop(df_train[df_train.LotArea>100000].index, inplace=True)
+df_train.drop(df_train[df_train.MasVnrArea>1500].index, inplace=True)
+df_train.drop(df_train[df_train.OpenPorchSF>500].index, inplace=True)
+
+
+# check missing data for categorical features
+PctMiss_cat_train = df_train[feature_cat].isnull().sum()*100/len(df_train)
+PctMiss_cat_train.sort_values(ascending=False, inplace=True)
+
+PctMiss_cat_test = df_test[feature_cat].isnull().sum()*100/len(df_test)
+PctMiss_cat_test.sort_values(ascending=False, inplace=True)
+
+
+# impute missing data of categorical features
+for x in feature_cat:
+    df_train[x].fillna('Others', inplace=True)
+    df_test[x].fillna('Others', inplace=True)
+
+# DATA VARIANCE
+# screen out numeric features with low variance
+constant_filter = VarianceThreshold(threshold=0.25) 
+constant_filter.fit(df_train[feature_num])
+constant_feature_num = [num for num in feature_num if num not in df_train[feature_num].columns[constant_filter.get_support()]]
+
+for x in constant_feature_num:
+    feature_num.remove(x)
+
+# screen out numeric features with high correlation
+def feature_corr(feature, corr_threshold):
+    corr_matrix = df_train[feature + ['SalePrice']].corr()
+    ToDrop = []
+    NotDrop = []
+    for i in range(len(corr_matrix)):
+        if corr_matrix.index[i] != 'SalePrice':
+            row_corr_saleprice = abs(corr_matrix['SalePrice'][i])
+            for j in range(i):
+                if corr_matrix.columns[j] != 'SalePrice':
+                    col_corr_saleprice = abs(corr_matrix['SalePrice'][j])
+                    if abs(corr_matrix.iloc[i][j]) >= corr_threshold:
+                       if row_corr_saleprice > col_corr_saleprice:
+                           if corr_matrix.index[j] not in ToDrop:
+                               ToDrop.append(corr_matrix.index[j])
+                               NotDrop.append(corr_matrix.index[i])
+                       else:
+                           if corr_matrix.index[i] not in ToDrop:
+                               ToDrop.append(corr_matrix.index[i])
+                               NotDrop.append(corr_matrix.index[j])
+    return ToDrop, NotDrop
+
+numToDrop, numNotDrop = feature_corr(feature_num, 0.8)
+
+for x in numToDrop:
+    feature_num.remove(x)
+
+# screen out categorical features with high dominance
+constant_feature_cat = []
+for x in feature_cat:
+    if df_train[x].value_counts().max()/len(df_train[x]) > 0.9:
+        constant_feature_cat.append(x)
+
+for x in constant_feature_cat:
+    feature_cat.remove(x)
+
+# DATA TRANSFORMATION
+# transform ordinal categorical features
+qual_dict1 = {'Others': 0, 'Po': 1, 'Fa': 2, 'TA': 3, 'Gd': 4, 'Ex': 5}
+df_train['ExterQual'] = df_train['ExterQual'].map(qual_dict1).astype(int)
+df_test['ExterQual'] = df_test['ExterQual'].map(qual_dict1).astype(int)
+df_train['HeatingQC'] = df_train['HeatingQC'].map(qual_dict1).astype(int)
+df_test['HeatingQC'] = df_test['HeatingQC'].map(qual_dict1).astype(int)
+    
+qual_dict2 = {'Others': 0, 'Unf': 1, 'LwQ': 2, 'Rec': 3, 'BLQ': 4, 'ALQ': 5, 'GLQ': 6}
+df_train['BsmtFinType1'] = df_train['BsmtFinType1'].map(qual_dict2).astype(int)
+df_test['BsmtFinType1'] = df_test['BsmtFinType1'].map(qual_dict2).astype(int)
+df_train['BsmtFinType2'] = df_train['BsmtFinType2'].map(qual_dict2).astype(int)
+df_test['BsmtFinType2'] = df_test['BsmtFinType2'].map(qual_dict2).astype(int)
+
+qual_dict3 = {'Others': 0, 'Unf': 1, 'RFn': 2, 'Fin': 3}
+df_train['GarageFinish'] = df_train.GarageFinish.map(qual_dict3).astype(int)
+df_test['GarageFinish'] = df_test.GarageFinish.map(qual_dict3).astype(int)
+
+qual_dict4 = {'Others': 0, 'Reg': 1, 'IR1':2, 'IR2':3, 'IR3': 4}
+df_train['LotShape'] = df_train.LotShape.map(qual_dict4).astype(int)
+df_test['LotShape'] = df_test.LotShape.map(qual_dict4).astype(int)
+
+feature_ordinal=['ExterQual', 'HeatingQC', 'BsmtFinType1', 'BsmtFinType2', 'GarageFinish', 'LotShape']
+
+for x in feature_ordinal:
+ feature_cat.remove(x)
+
+# group MSSubClass according to median of SalePrice
+remap = {180: 1, 30: 1, 45: 1, 190: 2, 50: 2, 90: 2, 85: 2, 40: 2, 160: 2, 70: 3, 20: 3, 75: 3, 80: 3, 120: 4, 60: 5}
+df_train['MSSubClass'].replace(remap, inplace=True)
+df_test['MSSubClass'].replace(remap, inplace=True)
+
+feature_num.remove('MSSubClass')
+feature_ordinal.append('MSSubClass')
+
+# encode remaining categorical features
+le = LabelEncoder()
+
+df_whole = df_train.append(df_test)
+
+for x in feature_cat:
+    df_whole[x] = le.fit_transform(df_whole[x])
+
+df_train = df_whole[:len(df_train)]
+df_test = df_whole[len(df_train):]
+
+catToDrop, catNotDrop = feature_corr(feature_cat, 0.8)
+for x in catToDrop:
+    feature_cat.remove(x)
+
+# Data Creation
+# summation of features
+df_train['TtlPorchArea'] = df_train.OpenPorchSF + df_train.EnclosedPorch + df_train['3SsnPorch'] + df_train.ScreenPorch + df_train.WoodDeckSF
+df_test['TtlPorchArea'] = df_test.OpenPorchSF + df_test.EnclosedPorch + df_test['3SsnPorch'] + df_test.ScreenPorch + df_test.WoodDeckSF
+
+df_train['TtlFootage'] = df_train.GrLivArea + df_train.BsmtFinSF1 + df_train.BsmtFinSF2
+df_test['TtlFootage'] = df_test.GrLivArea + df_test.BsmtFinSF1 + df_test.BsmtFinSF2
+
+df_train['TtlBath'] = df_train.FullBath + 0.5*df_train.HalfBath + df_train.BsmtFullBath + 0.5*df_train.BsmtHalfBath
+df_test['TtlBath'] = df_test.FullBath + 0.5*df_test.HalfBath + df_test.BsmtFullBath + 0.5*df_test.BsmtHalfBath
+
+df_train['Age'] = df_train['YrSold'] - df_train['YearBuilt']
+df_test['Age'] = df_test['YrSold'] - df_test['YearBuilt']
+
+df_train['Remod_Age'] = abs(df_train['YrSold'] - df_train['YearRemodAdd'])
+df_test['Remod_Age'] = abs(df_test['YrSold'] - df_test['YearRemodAdd'])
+
+df_train['RemodSinceBuilt'] = df_train['YearRemodAdd'] - df_train['YearBuilt']
+df_test['RemodSinceBuilt'] = df_test['YearRemodAdd'] - df_test['YearBuilt']
+
+df_train['LivAndBsmt'] = df_train['GrLivArea'] + df_train['TotalBsmtSF']*0.5
+df_test['LivAndBsmt'] = df_test['GrLivArea'] + df_test['TotalBsmtSF']*0.5
+
+feature_new_num = ['TtlPorchArea', 'TtlFootage', 'TtlBath', 'Age', 'Remod_Age', 'RemodSinceBuilt', 'LivAndBsmt']
+for x in feature_new_num:
+    feature_num.append(x)
+
+# binary features
+df_train.loc[df_train.OpenPorchSF>0, 'HasOpenPorch'] = 1
+df_train['HasOpenPorch'].fillna(0, inplace=True)
+df_test.loc[df_test.OpenPorchSF>0, 'HasOpenPorch'] = 1
+df_test['HasOpenPorch'].fillna(0, inplace=True)
+
+df_train.loc[df_train['2ndFlrSF']>0, 'Has2ndFlr'] = 1
+df_train['Has2ndFlr'].fillna(0, inplace=True)
+df_test.loc[df_test['2ndFlrSF']>0, 'Has2ndFlr'] = 1
+df_test['Has2ndFlr'].fillna(0, inplace=True)
+
+df_train['HasPool'] = df_train.PoolArea.apply(lambda x: 1 if x > 0 else 0)
+df_test['HasPool'] = df_test.PoolArea.apply(lambda x: 1 if x > 0 else 0)
+
+feature_new_bin = ['HasOpenPorch', 'Has2ndFlr', 'HasPool']
+
+# remove highly correlated features again
+numToDrop_2nd, numNotDrop_2nd = feature_corr(feature_num, 0.8)
+
+for x in numToDrop_2nd:
+    feature_num.remove(x)
+
+# reduce skewness for numeric feature
+df_whole = df_train.append(df_test)
+
+skewed = df_whole[feature_num + feature_ordinal].apply(lambda x: skew(x))
+skewed_high = skewed[abs(skewed) > 0.5]
+skewed_features = skewed_high.index
+
+lam = 0.3
+for x in skewed_features:
+    df_whole[x] = boxcox1p(df_whole[x], lam)
+
+# Model
+feature_total = feature_num + feature_ordinal + feature_cat + feature_new_bin
+df_whole_final = df_whole[feature_total]
+
+df_whole_final = pd.get_dummies(df_whole_final, columns=feature_cat)
+
+df_train_final = df_whole_final[:len(df_train)]
+df_test_final = df_whole_final[len(df_train):]
+
+X_train = df_train_final
+y_train = np.log1p(df_train['SalePrice'])
+
+kfolds = KFold(n_splits=10, shuffle=True, random_state=42)
+
+# tune model parameters
+
+model_Lasso = Lasso(random_state=42)
+
+grid_param_lasso = {'alpha': [0.0001, 0.0002, 0.0003, 0.0004, 0.0005]}
+
+gd_sr = GridSearchCV(estimator=model_Lasso,
+                     param_grid=grid_param_lasso,
+                     scoring='neg_mean_squared_log_error',
+                     cv=5,
+                     n_jobs=-1)
+
+gd_sr.fit(X_train, y_train)
+best_parameters = gd_sr.best_params_
+print(best_parameters)
+
+# model accuaracy on train dataset
+model_Lasso = Lasso(alpha=0.0004, random_state=42)
+
+all_accuracies = np.sqrt(-cross_val_score(estimator=model_Lasso, X=X_train, y=y_train, scoring='neg_mean_squared_error', cv=kfolds))
+print(all_accuracies.mean())
+
+
+# feature coefficients in Lasso model
+model_Lasso = LassoCV(alphas = [0.0004]).fit(X_train, y_train)
+
+coef = pd.Series(model_Lasso.coef_, index = X_train.columns)
+
+imp_coef = pd.concat([coef.sort_values().head(10),
+                     coef.sort_values().tail(10)])
+rcParams['figure.figsize'] = (8.0, 10.0)
+imp_coef.plot(kind = "barh")
+plt.title("Coefficients in Lasso Model")
+
+print("Lasso picked " + str(sum(coef != 0)) + " features and eliminated the other " +  str(sum(coef == 0)) + " features")
+
+
+
+# submission
+model_Lasso.fit(X_train, y_train)
+X_test = df_test_final
+predictions = np.exp(model_Lasso.predict(X_test))
+output = pd.DataFrame({'Id': df_test.Id, 'SalePrice': predictions.astype(float)})
+output.to_csv('my_submission.csv', index=False)
+print('Your submission was successfully saved!')
+
